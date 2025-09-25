@@ -5,15 +5,17 @@ import { ObjectId } from "mongodb";
 export default async function VideoPage({ params }: { params: { id: string } }) {
   const { db } = await connectToDatabase();
   const doc = await db.collection("studyPacks").findOne({ _id: new ObjectId(params.id) });
+
   if (!doc) return <div className="p-6">Not found</div>;
 
-  // Convert _id to id string for client components
+  // Convert _id to id string and pick only relevant fields
   const pack = {
     id: doc._id.toString(),
+    transcript: doc.transcript,
     notes: doc.notes,
-    flashcards: doc.flashcards,
     quiz: doc.quiz,
-    transcript: doc.transcript
+    // flashcards may be missing depending on backend
+    flashcards: doc.flashcards ?? null
   };
 
   return (

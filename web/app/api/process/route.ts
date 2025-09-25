@@ -1,70 +1,66 @@
 import { NextResponse } from "next/server";
-import { connectToDatabase } from "../../../utils/db";
-import { generateNotes, generateFlashcards, generateQuiz } from "../../../utils/ai";
-import { YoutubeTranscript } from "youtube-transcript";
+import { connectToDatabase } from "@/utils/db";
 import formidable from "formidable";
 import fs from "fs";
+import { callASR } from "@/utils/ai";
+import { YouTubeTranscriptApi } from "youtube-transcript-ts";
+import { ObjectId } from "mongodb";
 
-export const runtime = "edge" in process.env ? "edge" : "nodejs";
+export const runtime = "nodejs"; // Needed for file uploads
 
 export async function POST(req: Request) {
   try {
-    // Expect JSON { url?: string } OR multipart/form-data with file field 'file'
     const contentType = req.headers.get("content-type") || "";
-
     let transcriptText = "";
 
     if (contentType.includes("application/json")) {
-      const body = await req.json();
-      const { url } = body;
-      if (!url) return NextResponse.json({ error: "url is required" }, { status: 400 });
+      // YouTube/public video URL
+      const { url } = await req.json();
+      if (!url) return NextResponse.json({ error: "URL is required" }, { status: 400 });
 
-      // Use youtube-transcript to fetch transcript
-      // library expects id or full url
-      const transcript = await YoutubeTranscript.fetchTranscript(url);
-      transcriptText = transcript.map((t: any) => t.text).join(" ");
-    } else {
-      // handle multipart upload using formidable
-      // NOTE: this route runs under Node.js runtime (not edge)
-      const form = formidable({ multiples: false });
-      const { fields, files } = await new Promise<{ fields: formidable.Fields; files: formidable.Files }>((resolve, reject) => {
-        form.parse(req as any, (err: Error | null, fields: formidable.Fields, files: formidable.Files) => 
-          (err ? reject(err) : resolve({ fields, files }))
-        );
+      try {
+        const api = new YouTubeTranscriptApi();
+        const response = await api.fetchTranscript(url);
+        transcriptText = response.transcript.snippets.map(s => s.text).join(" ");
+        console.log(response.transcript.snippets);
+      } catch (err: any) {
+        console.error("YouTube transcript error:", err);
+      }
+
+    } else if (contentType.includes("multipart/form-data")) {
+      // File upload
+      const form = new formidable.IncomingForm({ multiples: false });
+      const { files } = await new Promise<{ files: formidable.Files }>((resolve, reject) => {
+        form.parse(req as any, (err, fields, files) => (err ? reject(err) : resolve({ files })));
       });
 
-      const file = (files as any)?.file;
-      if (!file) return NextResponse.json({ error: "file is required" }, { status: 400 });
+      const file = files?.file;
+      if (!file) return NextResponse.json({ error: "File is required" }, { status: 400 });
 
-      // For MVP: we store the file temporarily and call HuggingFace ASR in a later step.
-      // Here we'll just record file name and return a message (or you can call HF speech-to-text).
-      transcriptText = `Uploaded file: ${(file as any).originalFilename}. Please run ASR on server to transcribe (not implemented in this MVP).`;
+      const filePath = (file as any).filepath || (file as any).path;
+
+      // Read file and convert to base64 URL for HF ASR
+      const buffer = fs.readFileSync(filePath);
+      const base64 = `data:audio/wav;base64,${buffer.toString("base64")}`;
+      const asrRes = await callASR(base64);
+      transcriptText = asrRes?.data?.[0]?.text || "";
+    } else {
+      return NextResponse.json({ error: "Unsupported content type" }, { status: 400 });
     }
 
-    // Generate study assets
-    const [notes, flashcards, quiz] = await Promise.all([
-      generateNotes(transcriptText),
-      generateFlashcards(transcriptText),
-      generateQuiz(transcriptText)
-    ]);
-
-    // Save to DB: collection 'studyPacks'
+    // Save transcript to MongoDB
     const { db } = await connectToDatabase();
     const doc = {
-      source: "youtube",
-      url: (await (req.json?.() || {})).url || null,
+      source: "process",
       transcript: transcriptText,
-      notes,
-      flashcards,
-      quiz,
-      createdAt: new Date()
+      createdAt: new Date(),
     };
     const result = await db.collection("studyPacks").insertOne(doc);
-    const id = result.insertedId.toString();
 
-    return NextResponse.json({ id, notes, flashcards, quiz });
+    return NextResponse.json({ id: result.insertedId.toString(), transcript: transcriptText });
+
   } catch (err: any) {
     console.error("process error", err);
-    return NextResponse.json({ error: String(err.message || err) }, { status: 500 });
+    return NextResponse.json({ error: err.message || "Internal error" }, { status: 500 });
   }
 }
